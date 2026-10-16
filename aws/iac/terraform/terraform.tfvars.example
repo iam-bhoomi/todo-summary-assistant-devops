@@ -1,0 +1,11 @@
+# cp terraform.tfvars.example terraform.tfvars   (terraform.tfvars is git-ignored)
+region             = "ap-south-1"
+admin_cidr         = "203.0.113.7/32"                                   # curl -s https://checkip.amazonaws.com
+github_repo        = "iam-bhoomi/todo-summary-assistant-devops"
+repo_url           = "https://github.com/iam-bhoomi/todo-summary-assistant-devops.git"
+dockerhub_username = "your-dockerhub-user"
+# instance_type              = "t3.small"
+# key_name                   = "my-keypair"
+# db_multi_az                = true
+# db_backup_retention_days   = 7
+# create_github_oidc_provider = false

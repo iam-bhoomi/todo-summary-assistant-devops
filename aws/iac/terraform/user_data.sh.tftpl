@@ -1,0 +1,18 @@
+#!/bin/bash
+# EC2 bootstrap (Amazon Linux 2023): Docker + Compose, swap, repo checkout.
+# The first deployment is done by the CI pipeline (scripts/deploy.sh via SSM).
+set -euxo pipefail
+
+dnf install -y docker git
+systemctl enable --now docker
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/v2.39.2/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# 2 GiB swap: headroom for the JVM + monitoring on small instances
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
+git clone "${repo_url}" /opt/todo-app

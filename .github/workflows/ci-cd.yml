@@ -1,0 +1,154 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One pipeline per ref; a newer push to a PR cancels the older run
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ${{ vars.DOCKERHUB_USERNAME }}
+
+jobs:
+  # ---------------------------------------------------------------- test
+  backend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Backend/todo-summary-assistant
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}   # throwaway per-run DB, no literal password
+          MYSQL_DATABASE: todo_db
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      SPRING_DATASOURCE_URL: jdbc:mysql://127.0.0.1:3306/todo_db
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Build and test
+        run: mvn -B verify
+
+  frontend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Frontend/todo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: Frontend/todo/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Test
+        run: npm test -- --watchAll=false --passWithNoTests
+      - name: Build
+        # CRA turns lint warnings into errors when CI=true; the app has pre-existing
+        # warnings and business code is out of scope, so warnings stay non-fatal.
+        run: CI=false npm run build
+
+  # ---------------------------------------------------------------- build & push
+  docker:
+    needs: [backend-test, frontend-test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: todo-backend
+            context: Backend/todo-summary-assistant
+          - name: todo-frontend
+            context: Frontend/todo
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: |
+            ${{ env.IMAGE_REPO || 'local' }}/${{ matrix.name }}:${{ github.sha }}
+            ${{ env.IMAGE_REPO || 'local' }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ---------------------------------------------------------------- deploy
+  deploy:
+    needs: docker
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write   # GitHub OIDC -> short-lived AWS credentials, no access keys stored
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy to EC2 via SSM Run Command
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          CMD="cd /opt/todo-app && git fetch --quiet origin && git checkout --quiet --force ${GITHUB_SHA} && bash scripts/deploy.sh ${GITHUB_SHA}"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --timeout-seconds 600 \
+            --parameters "$(jq -cn --arg c "$CMD" '{commands: [$c], executionTimeout: ["600"]}')" \
+            --query Command.CommandId --output text)
+          echo "SSM command: $CMD_ID"
+
+          for _ in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                       --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Pending|InProgress|Delayed) sleep 5 ;; *) break ;; esac
+          done
+
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          echo "Deploy status: $STATUS"
+          [ "$STATUS" = "Success" ]
+
+      - name: Post-deploy health check
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "$APP_URL/healthz"
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors -o /dev/null -w "GET /api/todos -> %{http_code} in %{time_total}s\n" "$APP_URL/api/todos"

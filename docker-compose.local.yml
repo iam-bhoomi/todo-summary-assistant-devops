@@ -1,0 +1,22 @@
+# Local-only override: adds a MySQL container in place of RDS.
+# docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: todo_db
+      MYSQL_ROOT_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:?set SPRING_DATASOURCE_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      retries: 20
+
+  backend:
+    depends_on:
+      mysql: { condition: service_healthy }
+
+volumes:
+  mysql-data:

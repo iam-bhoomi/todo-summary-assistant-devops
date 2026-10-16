@@ -1,0 +1,65 @@
+# Few, actionable alerts. Each one means "a human should look now".
+# Rationale for what is (and is not) alerted on: MONITORING_AND_OPERATIONS.md
+groups:
+  - name: availability
+    rules:
+      - alert: BackendDown
+        expr: up{job="backend"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Backend is down"
+          description: "Prometheus cannot scrape the Spring Boot backend for 2 minutes. Check `docker compose ps` / `docker logs backend`."
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="backend",uri=~"/api.*",status=~"5.."}[5m]))
+            / sum(rate(http_server_requests_seconds_count{job="backend",uri=~"/api.*"}[5m])) > 0.05
+          and sum(rate(http_server_requests_seconds_count{job="backend",uri=~"/api.*"}[5m])) > 0.1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "API 5xx error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of API requests are failing."
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{job="backend",uri=~"/api/todos"}[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CRUD API p95 latency above 1s"
+          description: "p95 latency is {{ $value | humanizeDuration }} (excludes /summarize, which waits on Cohere)."
+
+      - alert: ContainerRestarting
+        expr: changes(container_start_time_seconds{name=~".+"}[15m]) > 2
+        labels: { severity: warning }
+        annotations:
+          summary: "Container {{ $labels.name }} is restart-looping"
+          description: "{{ $labels.name }} restarted more than twice in 15 minutes."
+
+  - name: host
+    rules:
+      - alert: HighCpu
+        expr: 100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Host CPU above 90% for 15m"
+          description: "CPU is {{ $value | printf \"%.0f\" }}%. On burstable (t3) instances check CPU credits."
+
+      - alert: LowMemory
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Host has less than 10% memory available"
+
+      - alert: LowDiskSpace
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Root disk below 15% free"
+          description: "Run `docker image prune -af` and check log sizes."

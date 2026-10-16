@@ -1,0 +1,11 @@
+.env
+*.pem
+.deployed_tag
+.previous_tag
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example

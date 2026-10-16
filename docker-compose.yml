@@ -1,0 +1,110 @@
+# Production stack (EC2): app + monitoring. The database is AWS RDS, never a container here.
+# Local dev adds MySQL:  docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+# Values come from .env (see .env.example). On EC2, scripts/deploy.sh writes .env from SSM Parameter Store.
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  backend:
+    image: ${IMAGE_REPO:-local}/todo-backend:${IMAGE_TAG:-latest}
+    build: ./Backend/todo-summary-assistant
+    restart: unless-stopped
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:?set SPRING_DATASOURCE_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:?set SPRING_DATASOURCE_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:?set SPRING_DATASOURCE_PASSWORD}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError}
+    mem_limit: 640m
+    logging: *logging
+
+  frontend:
+    image: ${IMAGE_REPO:-local}/todo-frontend:${IMAGE_TAG:-latest}
+    build: ./Frontend/todo
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "${APP_PORT:-80}:8080"
+    mem_limit: 64m
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/config/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      # directory (not file) mounts, so `git checkout` + SIGHUP picks up config changes
+      - ./monitoring:/etc/prometheus/config:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"   # not public; reach it via SSM/SSH port-forward
+    mem_limit: 256m
+    logging: *logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/config/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./monitoring:/etc/alertmanager/config:ro
+    secrets: [alert_slack_webhook]
+    ports:
+      - "127.0.0.1:9093:9093"
+    mem_limit: 64m
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring:/etc/grafana/dashboards:ro   # loads grafana-dashboard.json
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"   # security group limits this to the admin IP
+    mem_limit: 256m
+    logging: *logging
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes:
+      - /:/host:ro
+    mem_limit: 64m
+    logging: *logging
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    restart: unless-stopped
+    privileged: true
+    devices: ["/dev/kmsg"]
+    command: ["--docker_only=true", "--housekeeping_interval=15s"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    mem_limit: 128m
+    logging: *logging
+
+secrets:
+  alert_slack_webhook:
+    environment: ALERT_SLACK_WEBHOOK_URL
+
+volumes:
+  prometheus-data:
+  grafana-data:
