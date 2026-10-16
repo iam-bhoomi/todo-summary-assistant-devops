@@ -81,8 +81,12 @@ jobs:
           - name: todo-frontend
             context: Frontend/todo
     env:
-      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      # Push only from main, and only once the Docker Hub variable is configured
+      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DOCKERHUB_USERNAME != '' }}
     steps:
+      - name: Registry not configured
+        if: github.event_name != 'pull_request' && vars.DOCKERHUB_USERNAME == ''
+        run: echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN not set - images are built but not pushed, and deploy is skipped. See aws/aws-setup.md."
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
@@ -105,7 +109,10 @@ jobs:
   # ---------------------------------------------------------------- deploy
   deploy:
     needs: docker
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Runs once the registry and AWS target are configured (see aws/aws-setup.md)
+    if: >-
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      && vars.DOCKERHUB_USERNAME != '' && vars.EC2_INSTANCE_ID != ''
     runs-on: ubuntu-latest
     environment: production
     concurrency:
